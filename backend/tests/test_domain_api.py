@@ -5,6 +5,7 @@ from decimal import Decimal
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
@@ -201,6 +202,7 @@ def test_financial_dashboard_uses_only_unique_term_amount_per_current_document(c
         sha256="b" * 64,
         byte_size=256,
         processing_state="review",
+        invoice_workflow_state="invoices",
     )
     february_ambiguous = SourceDocument(
         source_key="local-copy-2026",
@@ -209,6 +211,7 @@ def test_financial_dashboard_uses_only_unique_term_amount_per_current_document(c
         sha256="c" * 64,
         byte_size=256,
         processing_state="review",
+        invoice_workflow_state="invoices",
     )
     invoice_only = SourceDocument(
         source_key="local-copy-2026",
@@ -217,6 +220,7 @@ def test_financial_dashboard_uses_only_unique_term_amount_per_current_document(c
         sha256="d" * 64,
         byte_size=256,
         processing_state="review",
+        invoice_workflow_state="invoices",
     )
     session.add_all([january, february_ambiguous, invoice_only])
     session.flush()
@@ -270,7 +274,119 @@ def test_financial_dashboard_uses_only_unique_term_amount_per_current_document(c
     assert len(payload["by_supplier"]) == 22
 
 
-def test_invoice_document_cards_group_by_supplier_and_material(client_and_session) -> None:
+def test_dashboard_financial_candidates_only_counts_approved_documents(client_and_session) -> None:
+    client, session_factory = client_and_session
+    session = session_factory()
+    pending_document = SourceDocument(
+        source_key="local-copy-2026",
+        relative_path="EXECUTADO & PROGRAMADO/SERVIÇO/PENDENTE/arquivo-pendente.pdf",
+        original_filename="arquivo-pendente.pdf",
+        sha256="a" * 64,
+        byte_size=100,
+        media_type="application/pdf",
+        processing_state="review",
+        invoice_workflow_state="quarantined",
+    )
+    approved_document = SourceDocument(
+        source_key="local-copy-2026",
+        relative_path="EXECUTADO & PROGRAMADO/SERVIÇO/APROVADO/arquivo-aprovado.pdf",
+        original_filename="arquivo-aprovado.pdf",
+        sha256="b" * 64,
+        byte_size=110,
+        media_type="application/pdf",
+        processing_state="review",
+        invoice_workflow_state="invoices",
+    )
+    session.add_all([pending_document, approved_document])
+    session.flush()
+    session.add_all([
+        ExtractionCandidate(
+            document_id=pending_document.id,
+            field_name="reimbursement_term_amount_brl",
+            raw_value="10,00",
+            normalized_value="10.00",
+            extraction_method="pdf_native_text",
+            evidence_location="page:1",
+            review_state="candidate",
+        ),
+        ExtractionCandidate(
+            document_id=pending_document.id,
+            field_name="organization_reference",
+            raw_value="SRA",
+            normalized_value="1",
+            extraction_method="user_catalog:pdf_native",
+            evidence_location="page:1",
+            review_state="candidate",
+        ),
+        ExtractionCandidate(
+            document_id=approved_document.id,
+            field_name="reimbursement_term_amount_brl",
+            raw_value="25,00",
+            normalized_value="25.00",
+            extraction_method="pdf_native_text",
+            evidence_location="page:1",
+            review_state="candidate",
+        ),
+        ExtractionCandidate(
+            document_id=approved_document.id,
+            field_name="organization_reference",
+            raw_value="SRA",
+            normalized_value="1",
+            extraction_method="user_catalog:pdf_native",
+            evidence_location="page:1",
+            review_state="candidate",
+        ),
+    ])
+    session.commit()
+    session.close()
+
+    response = client.get("/api/v1/dashboard/financial-candidates")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["included_term_documents"] == 1
+    assert payload["total_candidate_amount"] == "25.00"
+    assert payload["by_organization"][0] == {"name": "SRA", "amount": "25.00", "documents": 1}
+
+
+def test_manual_organization_proposal_replaces_original_without_leaving_group_unknown(client_and_session) -> None:
+    client, session_factory = client_and_session
+    session = session_factory()
+    document = SourceDocument(
+        source_key="local-copy-2026",
+        relative_path="EXECUTADO & PROGRAMADO/SERVIÇO/SERVIÇO NÃO CATALOGADO/documento-orgao.pdf",
+        original_filename="documento-orgao.pdf",
+        sha256="g" * 64,
+        byte_size=80,
+        media_type="application/pdf",
+        processing_state="review",
+    )
+    session.add(document)
+    session.flush()
+    original = ExtractionCandidate(
+        document_id=document.id,
+        field_name="organization_reference",
+        raw_value="SPU",
+        normalized_value="7",
+        extraction_method="pdf_native_text",
+        evidence_location="page:1",
+        review_state="candidate",
+    )
+    session.add(original)
+    session.commit()
+    response = client.post(
+        f"/api/v1/extraction-candidates/{original.id}/propose-correction",
+        json={
+            "corrected_value": "SRA",
+            "reason": "Orgão informado no documento é SRA.",
+        },
+    )
+    assert response.status_code == 200
+    cards = client.get("/api/v1/invoice-documents?pending_only=true&limit=10").json()
+    card = next(item for item in cards["items"] if item["id"] == str(document.id))
+    assert card["organization"] == "SRA"
+
+
+def test_invoice_document_cards_group_by_supplier_material_organization_and_service(client_and_session) -> None:
     client, session_factory = client_and_session
     session = session_factory()
     supplier_document = SourceDocument(
@@ -324,6 +440,24 @@ def test_invoice_document_cards_group_by_supplier_and_material(client_and_sessio
             review_state="candidate",
         ),
         ExtractionCandidate(
+            document_id=supplier_document.id,
+            field_name="organization_reference",
+            raw_value="SPU",
+            normalized_value="7",
+            extraction_method="user_catalog:pdf_native",
+            evidence_location="page:2",
+            review_state="candidate",
+        ),
+        ExtractionCandidate(
+            document_id=supplier_document.id,
+            field_name="service_reference",
+            raw_value="ÁGUA E ESGOTO - SAAE - ART SÃO MATEUS",
+            normalized_value="9",
+            extraction_method="user_catalog:pdf_native",
+            evidence_location="page:2",
+            review_state="candidate",
+        ),
+        ExtractionCandidate(
             document_id=material_document.id,
             field_name="invoice_amount_brl",
             raw_value="90,00",
@@ -338,9 +472,13 @@ def test_invoice_document_cards_group_by_supplier_and_material(client_and_sessio
 
     supplier_payload = client.get("/api/v1/invoice-documents?group_by=supplier&limit=20").json()
     material_payload = client.get("/api/v1/invoice-documents?group_by=material&limit=20").json()
+    organization_payload = client.get("/api/v1/invoice-documents?group_by=organization&limit=20").json()
+    service_payload = client.get("/api/v1/invoice-documents?group_by=service&limit=20").json()
 
     supplier_card = next(item for item in supplier_payload["items"] if item["filename"] == supplier_document.original_filename)
     material_card = next(item for item in material_payload["items"] if item["filename"] == material_document.original_filename)
+    organization_card = next(item for item in organization_payload["items"] if item["filename"] == supplier_document.original_filename)
+    service_card = next(item for item in service_payload["items"] if item["filename"] == supplier_document.original_filename)
     assert supplier_payload["page"]["total"] == 2
     assert supplier_card["group_name"] == "SAAE"
     assert supplier_card["service_associated"] == "ÁGUA E ESGOTO - SAAE - ART SÃO MATEUS"
@@ -352,6 +490,9 @@ def test_invoice_document_cards_group_by_supplier_and_material(client_and_sessio
     assert supplier_card["amount_comparison"] == "different"
     assert supplier_card["invoice_amount_candidates"][0]["normalized_value"] == "150.00"
     assert supplier_card["term_amount_candidates"][0]["normalized_value"] == "124.50"
+    assert organization_card["group_name"] == "SPU"
+    assert organization_card["organization"] == "SPU"
+    assert service_card["group_name"] == "ÁGUA E ESGOTO - SAAE - ART SÃO MATEUS"
     assert {candidate["field_name"] for candidate in supplier_card["amount_candidates"]} == {
         "reimbursement_term_amount_brl", "invoice_amount_brl",
     }
@@ -369,8 +510,8 @@ def test_quarantined_invoice_requires_complete_unique_candidates_before_release_
     session = session_factory()
     document = SourceDocument(
         source_key="local-copy-2026",
-        relative_path="EXECUTADO & PROGRAMADO/MATERIAL/COMBUSTÍVEL/COMBUSTÍVEL - 05 - MAIO.pdf",
-        original_filename="COMBUSTÍVEL - 05 - MAIO.pdf",
+        relative_path="EXECUTADO & PROGRAMADO/SERVIÇO/SERVIÇO NÃO CATALOGADO/documento.pdf",
+        original_filename="documento.pdf",
         sha256="b" * 64,
         byte_size=150,
         media_type="application/pdf",
@@ -399,7 +540,7 @@ def test_quarantined_invoice_requires_complete_unique_candidates_before_release_
     session.add_all([
         ExtractionCandidate(
             document_id=document.id,
-            field_name="invoice_amount_brl",
+            field_name="reimbursement_term_amount_brl",
             raw_value="6.940,22",
             normalized_value="6940.22",
             amount_role="total_amount",
@@ -418,6 +559,15 @@ def test_quarantined_invoice_requires_complete_unique_candidates_before_release_
         ),
         ExtractionCandidate(
             document_id=document.id,
+            field_name="billing_mode",
+            raw_value="Exclusiva",
+            normalized_value="exclusive",
+            extraction_method="manual_proposal",
+            evidence_location="manual_proposal:new_field",
+            review_state="candidate",
+        ),
+        ExtractionCandidate(
+            document_id=document.id,
             field_name="due_date",
             raw_value="27/03/2026",
             normalized_value="2026-03-27",
@@ -430,6 +580,15 @@ def test_quarantined_invoice_requires_complete_unique_candidates_before_release_
             field_name="organization_reference",
             raw_value="SRA",
             normalized_value="1",
+            extraction_method="manual_proposal",
+            evidence_location="manual_proposal:new_field",
+            review_state="candidate",
+        ),
+        ExtractionCandidate(
+            document_id=document.id,
+            field_name="material_reference",
+            raw_value="COMBUSTÍVEL",
+            normalized_value="4",
             extraction_method="manual_proposal",
             evidence_location="manual_proposal:new_field",
             review_state="candidate",
@@ -590,6 +749,107 @@ def test_candidate_correction_appends_proposal_without_confirming_or_overwriting
     assert audit_events[0].action == "candidate_correction_proposed"
     assert audit_events[0].after_state["reason"] == request_body["reason"]
 
+    card_payload = client.get("/api/v1/invoice-documents?pending_only=true&limit=10").json()
+    card = next(item for item in card_payload["items"] if item["id"] == str(document.id))
+    assert [item["raw_value"] for item in card["amount_candidates"]] == ["1.200,00"]
+    assert [item["id"] for item in card["editable_candidates"]] == [response.json()["proposal_id"]]
+
+
+def test_standard_invoice_review_batch_updates_multiple_fields_and_preserves_sources(client_and_session) -> None:
+    client, session_factory = client_and_session
+    session = session_factory()
+    document = SourceDocument(
+        source_key="local-copy-2026",
+        relative_path="EXECUTADO & PROGRAMADO/SERVIÇO/SERVIÇO NÃO CATALOGADO/documento-lote.pdf",
+        original_filename="documento-lote.pdf",
+        sha256="c" * 64,
+        byte_size=100,
+        processing_state="review",
+    )
+    session.add(document)
+    session.flush()
+    process_candidates = [
+        ExtractionCandidate(
+            document_id=document.id,
+            field_name="process_number",
+            raw_value=value,
+            normalized_value=value,
+            extraction_method="pdf_native_text",
+            evidence_location=f"page:{index}",
+            review_state="candidate",
+        )
+        for index, value in enumerate(("10783.000158/2024-59", "10783.000492/2026-74"), start=1)
+    ]
+    amount_candidate = ExtractionCandidate(
+        document_id=document.id,
+        field_name="reimbursement_term_amount_brl",
+        raw_value="1.250,00",
+        normalized_value="1250.00",
+        extraction_method="pdf_native_text",
+        evidence_location="page:1",
+        review_state="candidate",
+    )
+    session.add_all([*process_candidates, amount_candidate])
+    session.commit()
+    document_id = str(document.id)
+    process_ids = [str(candidate.id) for candidate in process_candidates]
+    amount_id = str(amount_candidate.id)
+    session.close()
+
+    response = client.post(
+        f"/api/v1/source-documents/{document_id}/propose-review-batch",
+        json={
+            "reason": "Campos consolidados conferidos com o documento original.",
+            "fields": [
+                {
+                    "field_name": "process_number",
+                    "corrected_value": "10783.000158/2024-59",
+                    "source_candidate_ids": process_ids,
+                    "replace_all": True,
+                },
+                {
+                    "field_name": "reimbursement_term_amount_brl",
+                    "corrected_value": "1.250,00",
+                    "source_candidate_ids": [amount_id],
+                    "amount_role": "total_amount",
+                    "amount_basis": "gross",
+                },
+                {"field_name": "billing_mode", "corrected_value": "exclusive"},
+                {"field_name": "organization_reference", "corrected_value": "1"},
+                {"field_name": "service_reference", "corrected_value": "2"},
+                {"field_name": "material_reference", "corrected_value": "4"},
+                {"field_name": "supplier_reference", "corrected_value": "2"},
+                {"field_name": "due_date", "corrected_value": "2026-03-27"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["created"] == 8
+    card_payload = client.get("/api/v1/invoice-documents?pending_only=true&limit=10").json()
+    card = next(item for item in card_payload["items"] if item["id"] == document_id)
+    assert card["process_number"] == "10783.000158/2024-59"
+    assert card["process_ambiguous"] is False
+    assert card["release_checks"][0]["complete"] is True
+    assert card["release_checks"][1]["complete"] is True
+    assert card["release_ready"] is True
+
+    released = client.post(
+        f"/api/v1/source-documents/{document_id}/release-to-invoices",
+        json={"reason": "Checklist concluído com evidência conferida."},
+    )
+    assert released.status_code == 200
+    assert released.json()["released"] is True
+    assert client.get("/api/v1/invoice-documents?pending_only=true").json()["page"]["total"] == 0
+    assert client.get("/api/v1/invoice-documents?pending_only=false").json()["page"]["total"] == 1
+
+    session = session_factory()
+    originals = [session.get(ExtractionCandidate, UUID(candidate_id)) for candidate_id in [*process_ids, amount_id]]
+    audit_events = session.scalars(select(AuditEvent)).all()
+    session.close()
+    assert all(candidate is not None and candidate.review_state == "candidate" for candidate in originals)
+    assert len(audit_events) == 9
+
 
 def test_manual_missing_amount_field_is_append_only_deduplicated_and_basis_aware(client_and_session) -> None:
     client, session_factory = client_and_session
@@ -655,6 +915,7 @@ def test_percentage_proposal_is_persisted_separately_and_excluded_from_financial
         sha256="a" * 64,
         byte_size=100,
         processing_state="review",
+        invoice_workflow_state="invoices",
     )
     session.add(document)
     session.flush()
@@ -702,8 +963,8 @@ def test_percentage_proposal_is_persisted_separately_and_excluded_from_financial
     session.close()
 
     cards = client.get("/api/v1/invoice-documents?pending_only=true&limit=10").json()
-    card = next(item for item in cards["items"] if item["id"] == document_id)
-    assert any(candidate["amount_role"] == "percentage" for candidate in card["amount_candidates"])
+    assert cards["page"]["total"] == 0
+    assert all(item["id"] != document_id for item in cards["items"])
     dashboard = client.get("/api/v1/dashboard/financial-candidates").json()
     assert dashboard["included_term_documents"] == 0
     assert dashboard["documents_without_term_amount"] == 1

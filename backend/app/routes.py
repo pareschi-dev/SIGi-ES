@@ -29,6 +29,7 @@ from app.models import (
 from app.schemas import (
     AlertPage,
     AdministrativeRuleProposal,
+    CandidateReviewBatch,
     CandidateCorrectionProposal,
     CatalogSummary,
     ExtractionCandidatePage,
@@ -88,7 +89,7 @@ AMOUNT_ROLES = {
 NON_CURRENCY_AMOUNT_ROLES = {"percentage", "quantity", "other_numeric"}
 CORRECTABLE_FIELDS = AMOUNT_FIELDS | {
     "process_number", "due_date", "organization_reference", "service_reference",
-    "material_reference", "supplier_reference",
+    "material_reference", "supplier_reference", "billing_mode",
 }
 
 
@@ -139,44 +140,86 @@ def _invoice_release_checks(
     """Return human-readable prerequisites before a PDF leaves quarantine."""
     superseded_ids = _superseded_candidate_ids(candidates)
     effective = [candidate for candidate in candidates if candidate.id not in superseded_ids]
-    amount_candidates = [candidate for candidate in effective if candidate.field_name in AMOUNT_FIELDS]
-    invoice_totals = [
+    term_amount_candidates = [
         candidate for candidate in effective
-        if candidate.field_name == "invoice_amount_brl"
-        and candidate.amount_role == "total_amount"
-        and candidate.normalized_value
+        if candidate.field_name == "reimbursement_term_amount_brl"
     ]
+    selected_term_totals: set[tuple[str, str]] = set()
+    for candidate in term_amount_candidates:
+        if candidate.amount_role != "total_amount" or not candidate.normalized_value:
+            continue
+        try:
+            amount = Decimal(candidate.normalized_value)
+        except InvalidOperation:
+            continue
+        if amount.is_finite() and amount > 0:
+            selected_term_totals.add((candidate.normalized_value, candidate.amount_basis or "unspecified"))
+    process_candidates = [candidate for candidate in effective if candidate.field_name == "process_number"]
     process_values = {
         candidate.normalized_value or candidate.raw_value
-        for candidate in effective if candidate.field_name == "process_number"
+        for candidate in process_candidates
+        if re.fullmatch(r"\d{5}\.\d{6}/\d{4}-\d{2}", candidate.normalized_value or candidate.raw_value)
     }
-    due_values = {
-        candidate.normalized_value or candidate.raw_value
-        for candidate in effective if candidate.field_name == "due_date"
-    }
+    due_values: set[str] = set()
+    due_candidates = [candidate for candidate in effective if candidate.field_name == "due_date"]
+    for candidate in due_candidates:
+        date_text = candidate.normalized_value or candidate.raw_value
+        try:
+            parsed_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+        except ValueError:
+            try:
+                parsed_date = datetime.strptime(date_text, "%d/%m/%Y").date()
+            except ValueError:
+                continue
+        due_values.add(parsed_date.isoformat())
+    organization_candidates = [candidate for candidate in effective if candidate.field_name == "organization_reference"]
     organization_values = {
         candidate.normalized_value
-        for candidate in effective
-        if candidate.field_name == "organization_reference"
-        and candidate.normalized_value in {str(item["id"]) for item in ORGANIZATIONS}
+        for candidate in organization_candidates
+        if candidate.normalized_value in {str(item["id"]) for item in ORGANIZATIONS}
+    }
+    billing_mode_candidates = [candidate for candidate in effective if candidate.field_name == "billing_mode"]
+    billing_modes = {
+        candidate.normalized_value
+        for candidate in billing_mode_candidates
+        if candidate.normalized_value in {"exclusive", "rateio"}
     }
     supplier, _ = _supplier_group_from_path(document.relative_path, effective)
-    material = _material_group_from_path(document.relative_path)
-    unclassified_amounts = [
-        candidate for candidate in amount_candidates
-        if candidate.amount_role in (None, "unspecified")
-    ]
+    supplier_ids = {
+        candidate.normalized_value
+        for candidate in effective
+        if candidate.field_name == "supplier_reference"
+        and candidate.normalized_value in {str(item["id"]) for item in SUPPLIERS}
+    }
+    if len(supplier_ids) == 1:
+        supplier_id = next(iter(supplier_ids))
+        supplier = next(str(item["nome"]) for item in SUPPLIERS if str(item["id"]) == supplier_id)
+    elif supplier_ids:
+        supplier = None
+
+    material_ids = {
+        candidate.normalized_value
+        for candidate in effective
+        if candidate.field_name == "material_reference"
+        and candidate.normalized_value in {str(item["id"]) for item in MATERIALS}
+    }
+    if len(material_ids) == 1:
+        material_id = next(iter(material_ids))
+        material = next(str(item["nome"]) for item in MATERIALS if str(item["id"]) == material_id)
+    elif material_ids:
+        material = None
+    else:
+        material = _material_group_from_path(document.relative_path)
     return [
         {
-            "key": "invoice_total",
-            "label": "Um único valor total da fatura classificado",
-            "complete": len(invoice_totals) == 1,
+            "key": "term_total",
+            "label": "Um único valor total de referência do termo classificado",
+            "complete": len(selected_term_totals) == 1,
         },
         {
-            "key": "all_numbers_classified",
-            "label": "Todos os números monetários candidatos classificados",
-            "complete": not unclassified_amounts,
-            "remaining": len(unclassified_amounts),
+            "key": "billing_mode",
+            "label": "Cobrança classificada como exclusiva ou rateio",
+            "complete": len(billing_mode_candidates) == 1 and len(billing_modes) == 1,
         },
         {
             "key": "process",
@@ -195,8 +238,12 @@ def _invoice_release_checks(
         },
         {
             "key": "organization",
-            "label": "Um único órgão associado por candidato revisado",
-            "complete": len(organization_values) == 1,
+            "label": "Órgão associado (um na exclusiva; um ou mais no rateio)",
+            "complete": (
+                len(organization_values) >= 1
+                if billing_modes == {"rateio"}
+                else len(organization_values) == 1
+            ),
         },
     ]
 
@@ -326,6 +373,46 @@ def _material_group_from_path(relative_path: str) -> str | None:
     return str(material["nome"]) if material else None
 
 
+def _organization_group_from_path(
+    relative_path: str,
+    candidates: list[ExtractionCandidate],
+) -> str | None:
+    known = {str(item["id"]): str(item["sigla"]) for item in ORGANIZATIONS}
+    candidate_ids = {
+        candidate.normalized_value
+        for candidate in candidates
+        if candidate.field_name == "organization_reference"
+        and candidate.normalized_value in known
+    }
+    if len(candidate_ids) == 1:
+        return known[next(iter(candidate_ids))]
+    if candidate_ids:
+        return None
+
+    filename_id = _filename_organization_reference(relative_path)
+    return known.get(filename_id) if filename_id else None
+
+
+def _service_group_from_path(
+    relative_path: str,
+    candidates: list[ExtractionCandidate],
+) -> str | None:
+    known = {str(item["id"]): str(item["nome"]) for item in SERVICES}
+    candidate_ids = {
+        candidate.normalized_value
+        for candidate in candidates
+        if candidate.field_name == "service_reference"
+        and candidate.normalized_value in known
+    }
+    if len(candidate_ids) == 1:
+        return known[next(iter(candidate_ids))]
+    if candidate_ids:
+        return None
+
+    service = _catalog_service_from_path(relative_path)
+    return str(service["nome"]) if service else None
+
+
 def _document_financial_value(candidates: list[ExtractionCandidate]) -> dict[str, str | bool | None]:
     superseded_ids = _superseded_candidate_ids(candidates)
     for field_name, label in (
@@ -426,6 +513,14 @@ def _normalize_proposed_candidate(field_name: str, value: str, amount_role: str 
                 raise HTTPException(status_code=422, detail="Data deve ser DD/MM/AAAA ou AAAA-MM-DD") from None
         return cleaned, parsed.isoformat()
 
+    if field_name == "billing_mode":
+        mode = _normalize_label(cleaned)
+        if mode in {"EXCLUSIVE", "EXCLUSIVA", "COBRANCA EXCLUSIVA"}:
+            return "Cobrança exclusiva", "exclusive"
+        if mode in {"RATEIO", "RATEADA", "COBRANCA RATEADA", "RATEIO ENTRE ORGAOS"}:
+            return "Rateio entre órgãos", "rateio"
+        raise HTTPException(status_code=422, detail="Selecione cobrança exclusiva ou rateio entre órgãos")
+
     catalog: list[dict[str, object]] | None = None
     if field_name == "organization_reference":
         catalog = ORGANIZATIONS
@@ -495,7 +590,9 @@ def dashboard_financial_candidates(session: Session = Depends(get_session)) -> d
     """
     latest_document_by_path: dict[tuple[str, str], SourceDocument] = {}
     documents = session.scalars(
-        select(SourceDocument).order_by(SourceDocument.last_seen_at.desc())
+        select(SourceDocument)
+        .where(SourceDocument.invoice_workflow_state == "invoices")
+        .order_by(SourceDocument.last_seen_at.desc())
     ).all()
     for document in documents:
         key = (document.source_key, document.relative_path)
@@ -651,7 +748,7 @@ def _empty_financial_candidate_summary() -> dict[str, object]:
 
 @router.get("/invoice-documents", tags=["invoices"])
 def list_invoice_documents(
-    group_by: Literal["supplier", "material"] = "supplier",
+    group_by: Literal["supplier", "material", "organization", "service"] = "supplier",
     limit: int = Query(default=48, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     search: str | None = Query(default=None, max_length=128),
@@ -660,8 +757,8 @@ def list_invoice_documents(
 ) -> dict[str, object]:
     """List imported PDFs as unconfirmed invoice/source-document cards.
 
-    Service names stay as supplier-associated metadata rather than a third
-    grouping dimension. Material groups are derived only from MATERIAL folders.
+    Group labels use unique catalog references or recognized relative-path
+    hints; unresolved/ambiguous references stay in an explicit unknown group.
     """
     documents = session.scalars(
         select(SourceDocument)
@@ -699,21 +796,37 @@ def list_invoice_documents(
     cards: list[dict[str, object]] = []
     for document in documents:
         candidates = candidates_by_document.get(document.id, [])
-        supplier, service = _supplier_group_from_path(document.relative_path, candidates)
+        superseded_ids = _superseded_candidate_ids(candidates)
+        effective_candidates = [candidate for candidate in candidates if candidate.id not in superseded_ids]
+        supplier, supplier_service = _supplier_group_from_path(document.relative_path, effective_candidates)
         material = _material_group_from_path(document.relative_path)
-        group_name = supplier if group_by == "supplier" else material
+        organization = _organization_group_from_path(document.relative_path, effective_candidates)
+        service = _service_group_from_path(document.relative_path, effective_candidates)
+        service_associated = service or supplier_service
+        group_name = {
+            "supplier": supplier,
+            "material": material,
+            "organization": organization,
+            "service": service,
+        }[group_by]
         if group_name is None:
-            group_name = "Fornecedor não identificado" if group_by == "supplier" else "Material não identificado"
+            unknown_group_names = {
+                "supplier": "Fornecedor não identificado",
+                "material": "Material não identificado",
+                "organization": "Órgão não identificado",
+                "service": "Serviço não identificado",
+            }
+            group_name = unknown_group_names[group_by]
 
         process_values = sorted({
             candidate.raw_value
             for candidate in candidates
-            if candidate.field_name == "process_number"
+            if candidate.field_name == "process_number" and candidate.id not in superseded_ids
         })
         due_values = sorted({
             candidate.raw_value
             for candidate in candidates
-            if candidate.field_name == "due_date"
+            if candidate.field_name == "due_date" and candidate.id not in superseded_ids
         })
         financial = _document_financial_value(candidates)
         amount_candidates = [
@@ -731,6 +844,7 @@ def list_invoice_documents(
             if candidate.field_name in {
                 "reimbursement_term_amount_brl", "invoice_amount_brl", "amount_brl",
             }
+            and candidate.id not in superseded_ids
         ]
         release_checks = _invoice_release_checks(document, candidates)
         pending_review = document.invoice_workflow_state == "quarantined"
@@ -742,7 +856,8 @@ def list_invoice_documents(
             "group_by": group_by,
             "group_name": group_name,
             "supplier": supplier,
-            "service_associated": service,
+            "organization": organization,
+            "service_associated": service_associated,
             "material": material,
             "process_number": process_values[0] if len(process_values) == 1 else None,
             "process_ambiguous": len(process_values) > 1,
@@ -774,6 +889,7 @@ def list_invoice_documents(
                 }
                 for candidate in candidates
                 if candidate.review_state == "candidate"
+                and candidate.id not in superseded_ids
                 and candidate.field_name in {
                     "process_number", "due_date", "amount_brl", "invoice_amount_brl",
                     "reimbursement_term_amount_brl", "organization_reference",
@@ -794,7 +910,7 @@ def list_invoice_documents(
         cards = [
             card for card in cards
             if normalized_search in _normalize_label(" ".join(str(card.get(key) or "") for key in (
-                "relative_path", "filename", "supplier", "service_associated", "material", "process_number",
+                "relative_path", "filename", "supplier", "organization", "service_associated", "material", "process_number",
             )))
         ]
 
@@ -893,6 +1009,186 @@ def return_source_document_to_review(
     ))
     session.commit()
     return {"document_id": str(document.id), "invoice_workflow_state": "quarantined", "returned_to_review": True}
+
+
+@router.post("/source-documents/{document_id}/propose-review-batch", tags=["review"])
+def propose_invoice_review_batch(
+    document_id: str,
+    batch: CandidateReviewBatch,
+    session: Session = Depends(get_session),
+) -> dict[str, object]:
+    """Append multiple field corrections in one auditable review operation."""
+    try:
+        parsed_document_id = UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Documento não encontrado") from None
+
+    document = session.get(SourceDocument, parsed_document_id)
+    if document is None or document.source_key != "local-copy-2026":
+        raise HTTPException(status_code=404, detail="Documento local não encontrado")
+
+    all_candidates = session.scalars(
+        select(ExtractionCandidate)
+        .where(ExtractionCandidate.document_id == document.id)
+        .where(ExtractionCandidate.review_state != "rejected")
+        .order_by(ExtractionCandidate.created_at)
+    ).all()
+    superseded_ids = _superseded_candidate_ids(all_candidates)
+    editable_by_id = {
+        candidate.id: candidate
+        for candidate in all_candidates
+        if candidate.review_state == "candidate" and candidate.id not in superseded_ids
+    }
+
+    created = duplicates = source_candidates_replaced = 0
+    used_source_ids: set[UUID] = set()
+
+    def append_proposal(
+        field_name: str,
+        raw_value: str,
+        normalized_value: str,
+        amount_basis: str | None,
+        amount_role: str | None,
+        evidence_location: str,
+        original: ExtractionCandidate | None,
+    ) -> None:
+        nonlocal created, duplicates
+        duplicate_query = select(ExtractionCandidate).where(
+            ExtractionCandidate.document_id == document.id,
+            ExtractionCandidate.field_name == field_name,
+            ExtractionCandidate.raw_value == raw_value,
+            ExtractionCandidate.normalized_value == normalized_value,
+            ExtractionCandidate.amount_role.is_(None) if amount_role is None
+            else ExtractionCandidate.amount_role == amount_role,
+            ExtractionCandidate.amount_basis.is_(None) if amount_basis is None
+            else ExtractionCandidate.amount_basis == amount_basis,
+            ExtractionCandidate.extraction_method == "manual_proposal",
+            ExtractionCandidate.evidence_location == evidence_location,
+            ExtractionCandidate.review_state == "candidate",
+        )
+        if session.scalar(duplicate_query) is not None:
+            duplicates += 1
+            return
+
+        proposal = ExtractionCandidate(
+            document_id=document.id,
+            field_name=field_name,
+            raw_value=raw_value,
+            normalized_value=normalized_value,
+            amount_basis=amount_basis,
+            amount_role=amount_role,
+            extraction_method="manual_proposal",
+            evidence_location=evidence_location,
+            confidence=None,
+            review_state="candidate",
+        )
+        session.add(proposal)
+        session.flush()
+        session.add(AuditEvent(
+            action="candidate_correction_proposed" if original else "candidate_manual_field_proposed",
+            entity_type="extraction_candidate",
+            entity_id=proposal.id,
+            before_state={
+                "source_candidate_id": str(original.id),
+                "field_name": original.field_name,
+                "raw_value": original.raw_value,
+                "normalized_value": original.normalized_value,
+                "amount_basis": original.amount_basis,
+                "amount_role": original.amount_role,
+            } if original else None,
+            after_state={
+                "document_id": str(document.id),
+                "source_candidate_id": str(original.id) if original else None,
+                "field_name": proposal.field_name,
+                "raw_value": proposal.raw_value,
+                "normalized_value": proposal.normalized_value,
+                "amount_basis": proposal.amount_basis,
+                "amount_role": proposal.amount_role,
+                "reason": batch.reason,
+                "review_state": "candidate",
+            },
+        ))
+        created += 1
+
+    for field in batch.fields:
+        field_name = field.field_name
+        if field_name not in CORRECTABLE_FIELDS:
+            raise HTTPException(status_code=422, detail=f"Campo não permitido: {field_name}")
+        if field_name in AMOUNT_FIELDS and field_name != "reimbursement_term_amount_brl":
+            raise HTTPException(
+                status_code=422,
+                detail="A revisão consolidada aceita um único campo de valor, priorizando o total identificado no termo de recebimento.",
+            )
+
+        source_ids = list(dict.fromkeys(field.source_candidate_ids))
+        if source_ids:
+            originals = []
+            for source_id in source_ids:
+                original = editable_by_id.get(source_id)
+                if original is None or original.field_name != field_name:
+                    raise HTTPException(status_code=422, detail="Candidato de origem inválido para este documento/campo")
+                if source_id in used_source_ids:
+                    raise HTTPException(status_code=422, detail="Um candidato não pode ser incluído em mais de um campo")
+                used_source_ids.add(source_id)
+                originals.append(original)
+
+            original_values = {
+                candidate.normalized_value or candidate.raw_value
+                for candidate in originals
+            }
+            if field.corrected_value is not None and len(original_values) > 1 and not field.replace_all:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"O campo {field_name} possui valores distintos; marque a substituição do grupo para aplicar um único valor a todos.",
+                )
+
+            for original in originals:
+                raw_value = field.corrected_value if field.corrected_value is not None else original.raw_value
+                amount_role = field.amount_role if field.amount_role is not None else original.amount_role
+                amount_basis_input = field.amount_basis if field.amount_basis is not None else original.amount_basis
+                amount_role = _amount_role(field_name, amount_role)
+                amount_basis = (
+                    None if amount_role in NON_CURRENCY_AMOUNT_ROLES
+                    else _amount_basis(field_name, amount_basis_input)
+                )
+                normalized_raw, normalized_value = _normalize_proposed_candidate(field_name, raw_value, amount_role)
+                if (
+                    normalized_raw == original.raw_value
+                    and normalized_value == original.normalized_value
+                    and amount_role == original.amount_role
+                    and amount_basis == original.amount_basis
+                ):
+                    continue
+                append_proposal(
+                    field_name, normalized_raw, normalized_value, amount_basis, amount_role,
+                    f"manual_proposal:prior:{original.id}", original,
+                )
+                source_candidates_replaced += 1
+        elif field.corrected_value is not None:
+            amount_role = _amount_role(field_name, field.amount_role)
+            amount_basis = (
+                None if amount_role in NON_CURRENCY_AMOUNT_ROLES
+                else _amount_basis(field_name, field.amount_basis)
+            )
+            raw_value, normalized_value = _normalize_proposed_candidate(
+                field_name, field.corrected_value, amount_role
+            )
+            append_proposal(
+                field_name, raw_value, normalized_value, amount_basis, amount_role,
+                "manual_proposal:new_field", None,
+            )
+
+    if created:
+        session.commit()
+    else:
+        session.rollback()
+    return {
+        "document_id": str(document.id),
+        "created": created,
+        "duplicates": duplicates,
+        "source_candidates_replaced": source_candidates_replaced,
+        "confirmed": False,
+    }
 
 
 @router.post("/extraction-candidates/{candidate_id}/propose-correction", tags=["review"])

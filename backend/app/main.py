@@ -46,12 +46,22 @@ app.include_router(domain_router)
 
 @app.get("/api/v1/monitor/status", tags=["monitoring"])
 def monitor_status() -> dict[str, object]:
-    """Return monitor counters without disclosing the monitored absolute path."""
+    """Return monitor state, its configured local root, and operational counters."""
     monitor = getattr(app.state, "file_monitor", None)
     if monitor is None:
-        return {"enabled": False, "running": False}
+        return {
+            "enabled": False,
+            "running": False,
+            "status": "inativo",
+            "root": None,
+        }
     status = monitor.status()
-    return {"enabled": True, **asdict(status)}
+    return {
+        "enabled": True,
+        **asdict(status),
+        "status": "ativo" if status.running else "inativo",
+        "root": str(monitor.root),
+    }
 
 
 class HealthResponse(BaseModel):

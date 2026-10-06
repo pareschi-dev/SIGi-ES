@@ -156,6 +156,27 @@ class ManualCandidateProposal(CandidateCorrectionProposal):
     field_name: str = Field(min_length=1, max_length=64)
 
 
+class CandidateReviewField(BaseModel):
+    """One standard field reviewed in a multi-field invoice correction form."""
+
+    field_name: str = Field(min_length=1, max_length=64)
+    corrected_value: str | None = Field(default=None, min_length=1, max_length=2000)
+    source_candidate_ids: list[UUID] = Field(default_factory=list, max_length=1000)
+    amount_basis: Literal["gross", "net", "unspecified"] | None = None
+    amount_role: Literal[
+        "unspecified", "total_amount", "installment_amount", "percentage", "interest",
+        "penalty", "fine", "discount", "tax", "fee", "unit_price", "quantity", "other_numeric",
+    ] | None = None
+    replace_all: bool = False
+
+
+class CandidateReviewBatch(BaseModel):
+    """Append a reviewed set of field proposals without mutating source candidates."""
+
+    fields: list[CandidateReviewField] = Field(min_length=1, max_length=20)
+    reason: str = Field(min_length=5, max_length=1000)
+
+
 class AdministrativeRuleProposal(BaseModel):
     """A draft rule; it never changes extraction or confirms financial values."""
 

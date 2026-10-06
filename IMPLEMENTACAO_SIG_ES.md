@@ -3,9 +3,103 @@
 > Registro cumulativo do que foi iniciado, implementado e validado. Atualizar este arquivo **no início de cada nova etapa** e novamente ao concluí-la. Informações de demonstração não representam dados oficiais.
 
 ## Estado atual
-- Etapa ativa: **Etapa 20 — Manutenção do aviso de não homologação**
-- Situação: submenus laterais agora têm guia visual, ícones, alvos de toque maiores e estado selecionado; subabas internas de Configurações formam um seletor segmentado mais visível. Build e conferência visual em janela compacta e desktop passaram; regras seguem em rascunho.
-- Atualizado em: 29/09/2026
+- Etapa ativa: **Etapa 34 — Revisão de pendências e liberação de faturas**
+- Situação: iniciada; investigar por que faturas não avançam, permitir concluir os requisitos no formulário, destacar campos ausentes/ambíguos e selecionar referências do catálogo local não verificado.
+- Atualizado em: 03/10/2026
+
+### Etapa 35 — Sincronização do repositório e commit de implementação (em execução)
+- [x] Registrar o estado desta etapa no arquivo de implementação antes de salvar o progresso no Git.
+- [x] Confirmar o estado atual do repositório e preparar o commit com a mensagem solicitada.
+- [ ] Realizar o commit final com a mensagem `implementação do sistema na SRA-ES` após revisão do status do Git.
+
+### Etapa 34 — Revisão de pendências e liberação de faturas (iniciada)
+- [x] Fechar lacunas do formulário que impedem concluir requisitos da liberação e permitir salvar alterações antes de tentar a transição.
+- [x] Destacar campos vinculados a requisitos incompletos e refletir a resposta autoritativa da API.
+- [x] Carregar opções de órgão, serviço, material e fornecedor do catálogo local para seleção explícita.
+- [x] Preservar propostas não confirmadas, auditoria e arquivos originais; o catálogo continua não verificado.
+- [x] Validar fila, formulário de edição, API de liberação, frontend e backend.
+- Diagnóstico final: a regra de liberação estava quebrada por um filtro de organização em `backend/app/routes.py` que iterava sobre um valor booleano em vez de sobre os candidatos válidos; essa condição impedia o cálculo do checklist e a transição de documentos em quarentena.
+- Validação final: backend `47 passed`; `npm run build` concluído. Avisos não bloqueantes: depreciação do `starlette.testclient`/`httpx` e bundle frontend acima de 500 kB.
+
+### Etapa 33 — Dashboard restringido a faturas aprovadas (em implementação)
+- [x] Ajustar o filtro do resumo financeiro do dashboard para ignorar documentos em `quarantined` e ler somente `invoice_workflow_state == "invoices"`.
+- [x] Registrar teste de regressão para garantir que pendentes de avaliação manual não entrem no cálculo do dashboard por padrão.
+- Decisão de negócio: o painel passa a considerar apenas faturas liberadas para o fluxo principal; documentos ainda em revisão permanecem fora do dashboard até aprovação manual.
+- Validação executada: `pytest tests/test_domain_api.py -k 'approved_documents or invoice_document_cards_group_by_supplier_material_organization_and_service'` → 2 testes passaram.
+
+### Etapa 32 — Reinicialização após conflito de porta (concluída)
+- [x] Parar somente o processo identificado na porta 8000, conforme solicitado, e confirmar que as portas 8000 e 5173 ficaram livres.
+- [x] Iniciar novamente o SIG-ES com o inicializador local e validar a API e a interface.
+- Diagnóstico inicial: a porta 8000 está em `127.0.0.1` no PID 19400 (`python.exe`, executável `C:\python314\python.exe`), fora do ambiente virtual deste workspace; a porta 5173 está livre. Nenhum serviço Windows está associado ao PID.
+- Limite: não reutilizar a instância Python externa nem presumir qual banco ela atende; iniciar usando as configurações do inicializador deste workspace.
+- Resultado: PID 19400 encerrado; a API e o frontend foram iniciados pelo inicializador oficial em `127.0.0.1`. O healthcheck respondeu `ok`, com PostgreSQL conectado e ambiente `local_unverified`; a interface carregou e confirmou “API + postgresql: conectados”. O inicializador usa o fluxo configurado para o banco `SIG-SAMF` e migrações pendentes.
+- Validação: `GET /api/v1/health` HTTP 200; interface `/dashboard` HTTP 200 e conexão confirmada visualmente. Sem alteração de código de aplicação.
+
+### Etapa 31 — Inicialização do sistema por duplo clique (concluída)
+- [x] Criar um arquivo `.bat` na raiz que execute `iniciar-siges.ps1` a partir de qualquer diretório.
+- [x] Documentar o uso por duplo clique e manter visíveis requisitos/erros do inicializador.
+- [x] Validar o lançador, o build da interface e testes do backend.
+- Validação: o iniciador detectou corretamente a porta 8000 ocupada e parou sem iniciar serviços conflitantes; o PID 19400 pertence a outra aplicação (`SIGi-Certidões-v2.2`), que foi mantida em execução. Sintaxe PowerShell válida. `npm run build` concluído, com aviso conhecido de bundle >500 kB. Backend: 43 testes passaram e 2 falharam em `test_domain_api.py` (`release_ready` e revisão em lote retornando 422); nenhuma alteração foi feita nessa área.
+
+### Etapa 29 — Inclusão de múltiplos campos pendentes (concluída)
+- [x] Fazer cada seleção do menu “Adicionar campo à proposta” inserir imediatamente uma linha com entrada própria e ação de remoção.
+- [x] Permitir incluir vários tipos de campo na mesma edição, com rótulo e tipo de entrada correspondente (por exemplo, data de vencimento como data e processo com formato de exemplo).
+- [x] Enviar cada campo como proposta não confirmada ao salvar; exigir valor em cada linha e justificativa comum, mantendo os originais.
+- [x] Mostrar a quantidade de campos no botão de salvar e apresentar erros dentro da janela.
+- Validação: `npm run build` concluído; TypeScript/editor sem erros; conferência no navegador selecionando vencimento e processo mostrou as duas entradas editáveis e o botão “Salvar 2 campo(s)”. Nenhum dado de teste foi salvo. Aviso não bloqueante de bundle acima de 500 kB permanece.
+
+### Etapa 28 — Edição explícita dos campos da quarentena (concluída)
+- [x] Abrir o editor em “Adicionar campo” e exibir imediatamente o seletor com valor de fatura, termo, processo, vencimento, órgão, serviço, material e fornecedor.
+- [x] Separar explicitamente adicionar novo campo de corrigir candidato existente, com seleção acessível dos candidatos registrados.
+- [x] Não incluir candidatos já substituídos na lista de valores/candidatos editáveis, preservando os registros originais no banco e a trilha de auditoria.
+- [x] Reconhecer referências únicas manuais de material/fornecedor no requisito de catálogo do checklist.
+- [x] Testar cartão após correção e referência manual de material sem inferência da pasta.
+- Validação: build frontend concluído; suíte backend `44 passed`; diagnósticos do editor sem erros. Permanece aviso não bloqueante do bundle acima de 500 kB. API local pode necessitar reinicialização para carregar mudanças de servidor.
+
+### Etapa 27 — Diagnóstico da revisão e exibição de candidatos pendentes (análise concluída)
+- O cartão compacto não exibe o checklist; ele aparece no detalhe e no formulário de edição. Após salvar, o frontend fecha o formulário e recarrega os dados.
+- O checklist calcula valores/processo/data/órgão a partir de candidatos efetivos, mas a condição fornecedor/material consulta o material somente pela pasta (`_material_group_from_path`) e ignora um `material_reference` proposto manualmente.
+- A lista `editable_candidates` inclui candidatos substituídos porque a API filtra por `review_state == candidate`, sem remover/identificar os IDs em `manual_proposal:prior:<id>`. O valor anterior e a proposta aparecem juntos, podendo confundir a revisão e a contagem resumida.
+- A associação manual de fornecedor também é restringida pela compatibilidade com serviço/pasta; uma referência válida isolada pode não contar como grupo reconhecido.
+- Correções do checklist de material/fornecedor e exclusão de candidatos substituídos da seleção corrente foram implementadas na Etapa 28; os registros originais permanecem preservados.
+
+### Etapa 26 — Endereços diretos para as páginas (concluída)
+- [x] Criar rotas para Dashboard, Faturas, Faturas pendentes, Documentos importados, Processos SEI, Alertas, Saldos, Auditoria e as abas de Configurações.
+- [x] Atualizar o endereço ao navegar e sincronizar voltar/avançar do navegador.
+- [x] Suportar acesso direto/recarga em páginas internas e normalizar `/` para `/dashboard`.
+- Validação: `npm run build` concluído; navegador confirmou `/dashboard`, `/faturas`, `/configuracoes` e `/configuracoes/regras-administrativas`, além de voltar para `/dashboard`. Nenhum erro TypeScript; aviso não bloqueante de bundle acima de 500 kB permanece.
+
+### Etapa 25 — Filtros de faturas por quatro dimensões (concluída no código)
+- [x] Adicionar filtros por fornecedor, material, órgão e serviço.
+- [x] Agrupar por referências únicas de catálogo/candidatos e por caminho relativo reconhecido; manter grupo não identificado quando a associação é ambígua ou ausente.
+- [x] Incluir a associação de órgão nos dados da API, detalhes e pesquisa.
+- [x] Cobrir os quatro valores de `group_by` no teste da API.
+- Validação: suíte backend `44 passed`; `npm run build` concluído; diagnósticos do editor sem erros. A instância da API aberta no navegador respondeu HTTP 422 ao novo filtro de órgão porque ainda está executando código anterior; reiniciá-la para aplicar a mudança. Aviso não bloqueante do bundle >500 kB permanece.
+
+### Etapa 24 — Resumo compacto e detalhe de faturas (concluída)
+- [x] Manter nos cartões apenas arquivo, valor candidato da fatura, processo, vencimento e estado do fluxo.
+- [x] Padronizar a altura dos cartões e tornar o resumo inteiro selecionável, com suporte a teclado.
+- [x] Exibir em janela de detalhes as informações do documento, valores candidatos, classificação, evidências, estados, checklist de quarentena e acesso ao PDF original.
+- [x] Manter a correção de candidatos disponível a partir do detalhe, sem alterar o fluxo de preservação do original.
+- Validação: `npm run build` concluído; interação de abrir/fechar detalhes conferida no navegador e diagnósticos do editor sem erros. Aviso não bloqueante de bundle acima de 500 kB permanece.
+
+### Etapa 23 — Alinhamento dos gráficos por órgão e por mês (concluída)
+- [x] Posicionar “Valor por órgão” ao lado de “Evolução mensal” na mesma linha em telas largas.
+- [x] Manter os cartões de serviços, materiais e fornecedores em uma linha separada e responsiva.
+- [x] Validar o build e conferir visualmente os dois gráficos lado a lado em viewport desktop.
+- Validação: `npm run build` concluído; TypeScript/editor sem erros. Aviso não bloqueante de bundle acima de 500 kB permanece.
+
+### Etapa 22 — Separação dos cartões do dashboard por categoria (concluída)
+- [x] Separar Serviços, Materiais e Fornecedores em cartões próprios.
+- [x] Ajustar o grid para quatro cartões no desktop, duas colunas em telas médias e uma em telas estreitas.
+- [x] Preservar as agregações, contagens, avisos de associação segura e identificação dos valores em BRL como candidatos.
+- Validação: `npm run build` concluído; TypeScript/editor sem erros. Permanece apenas o aviso conhecido de bundle acima de 500 kB. Interface conferida no ambiente local; API/banco indisponíveis durante a conferência.
+
+### Etapa 21 — Exposição do status do monitor pela API (concluída)
+- [x] Retornar status ativo/inativo e raiz monitorada em `GET /api/v1/monitor/status`.
+- [x] Cobrir configurações com monitor ativo e sem monitor em testes da API.
+- Restrição: revelar a raiz local somente neste endpoint operacional solicitado; manter a API em loopback e não registrar o caminho em logs nem persistir caminho absoluto.
+- Validação: suíte completa do backend — 44 testes aprovados; um aviso de depreciação do `starlette.testclient`/`httpx` permanece não bloqueante.
 
 ### Etapa 11 — Execução demonstrativa em rede local (iniciada)
 - [x] Iniciar API e frontend vinculados às interfaces de rede locais.

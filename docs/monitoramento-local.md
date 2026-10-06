@@ -2,7 +2,7 @@
 
 ## Escopo configurado
 
-O observador pode ser iniciado explicitamente com `-MonitorRoot 'C:\2026'` no script `backend/run-local.ps1`. Sem esse parâmetro, monitoramento permanece desabilitado. A raiz não é gravada no banco nem retornada pela API.
+O observador pode ser iniciado explicitamente com `-MonitorRoot 'C:\2026'` no script `backend/run-local.ps1`. Sem esse parâmetro, monitoramento permanece desabilitado. A raiz não é gravada no banco; ela é exposta somente no endpoint operacional local de status.
 
 ## O que faz
 
@@ -11,7 +11,8 @@ O observador pode ser iniciado explicitamente com `-MonitorRoot 'C:\2026'` no sc
 - Aguarda estabilidade do tamanho/timestamps; ignora arquivos removidos, inacessíveis, simbólicos, fora da raiz ou maiores que 100 MiB.
 - Lê os bytes somente para calcular SHA-256 e grava no PostgreSQL metadados, caminho relativo, tipo inferido e hash. Não armazena conteúdo do arquivo.
 - Preserva arquivos originais: não renomeia, move, apaga nem edita.
-- A API de estado mostra contadores e chave lógica da fonte, nunca o caminho absoluto.
+- `GET /api/v1/monitor/status` retorna `status` (`ativo`/`inativo`), `root` (caminho absoluto configurado ou `null` quando desabilitado), `running`, `enabled` e contadores operacionais.
+- A resposta revela o caminho local da raiz monitorada; como a API não tem autenticação, mantenha-a restrita a `127.0.0.1` e não a exponha à rede.
 
 ## Limites atuais
 
